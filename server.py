@@ -1,9 +1,10 @@
 # server.py
 from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 import re
 import asyncio
-from typing import Optional, Dict
+from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Casa del Libro API")
 
@@ -13,6 +14,9 @@ _context = None
 
 # limita concurrencia para que no revientes el navegador
 sem = asyncio.Semaphore(2)
+
+def clean_isbn(isbn: str) -> str:
+    return (isbn or "").strip().replace(" ", "")
 
 def normalize_price(text: Optional[str]) -> Optional[str]:
     if not text:
@@ -37,7 +41,6 @@ async def startup():
     global _pw, _browser, _context
     _pw = await async_playwright().start()
 
-    # en local: prueba primero con headless=False para confirmar que es el headless el culpable
     _browser = await _pw.chromium.launch(
         headless=True,
         args=[
@@ -73,11 +76,21 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
-@app.get("/casadellibro")
-async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
+# --- tu lógica de scraping en una función reutilizable ---
+async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     global _context
-    isbn = isbn.strip().replace(" ", "")
+    isbn = clean_isbn(isbn)
     url = f"https://www.casadellibro.com/libros?query={isbn}"
+
+    # validación básica (mismo criterio que Query)
+    if not (10 <= len(isbn) <= 13) or not isbn.isdigit():
+        return {
+            "isbn": isbn,
+            "price_current_eur": None,
+            "price_previous_eur": None,
+            "url": url,
+            "error": "Invalid ISBN (must be 10-13 digits)",
+        }
 
     async with sem:
         page = await _context.new_page()
@@ -85,7 +98,6 @@ async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
             await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             await accept_cookies(page)
 
-            # clave: muchas veces el precio aparece tarde; networkidle ayuda bastante
             try:
                 await page.wait_for_load_state("networkidle", timeout=30000)
             except Exception:
@@ -126,3 +138,49 @@ async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
             }
         finally:
             await page.close()
+
+# --- endpoint unitario (se queda igual, pero llamando a la función) ---
+@app.get("/casadellibro")
+async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
+    return await scrape_casadellibro_one(isbn)
+
+# =========================
+# NUEVO: endpoint BATCH
+# =========================
+
+class BatchRequest(BaseModel):
+    isbns: List[str] = Field(..., min_items=1, description="Lista de ISBNs (10-13 dígitos)")
+
+class BatchResponse(BaseModel):
+    source: str
+    count: int
+    results: List[Dict[str, Any]]
+
+@app.post("/casadellibro/batch", response_model=BatchResponse)
+async def casadellibro_batch(req: BatchRequest):
+    # limpia y quita vacíos, pero sin reordenar demasiado
+    isbns = [clean_isbn(x) for x in req.isbns if clean_isbn(x)]
+
+    # si el usuario manda vacío, devolvemos sin romper
+    if not isbns:
+        return {"source": "casadellibro", "count": 0, "results": []}
+
+    # crea tareas (la concurrencia real la controla tu semáforo)
+    tasks = [scrape_casadellibro_one(isbn) for isbn in isbns]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # si alguna task explotó, la convertimos a error por item
+    fixed_results: List[Dict[str, Any]] = []
+    for isbn, r in zip(isbns, results):
+        if isinstance(r, Exception):
+            fixed_results.append({
+                "isbn": isbn,
+                "price_current_eur": None,
+                "price_previous_eur": None,
+                "url": f"https://www.casadellibro.com/libros?query={isbn}",
+                "error": str(r),
+            })
+        else:
+            fixed_results.append(r)
+
+    return {"source": "casadellibro", "count": len(fixed_results), "results": fixed_results}
