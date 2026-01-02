@@ -36,6 +36,20 @@ async def accept_cookies(page) -> None:
         except Exception:
             pass
 
+async def has_no_results(page) -> bool:
+    """
+    Casa del Libro cuando NO encuentra resultados muestra el texto:
+    'No se han encontrado resultados para ...'
+    En ese caso NO debemos leer precios de 'Más vistos' / recomendaciones.
+    """
+    try:
+        loc = page.locator("text=/No se han encontrado resultados/i")
+        if await loc.count() > 0 and await loc.first.is_visible():
+            return True
+    except Exception:
+        pass
+    return False
+
 @app.on_event("startup")
 async def startup():
     global _pw, _browser, _context
@@ -76,13 +90,13 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
-# --- tu lógica de scraping en una función reutilizable ---
+# --- scraping reutilizable ---
 async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     global _context
     isbn = clean_isbn(isbn)
     url = f"https://www.casadellibro.com/libros?query={isbn}"
 
-    # validación básica (mismo criterio que Query)
+    # validación básica
     if not (10 <= len(isbn) <= 13) or not isbn.isdigit():
         return {
             "isbn": isbn,
@@ -98,15 +112,50 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
             await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             await accept_cookies(page)
 
+            # deja que cargue contenido dinámico
             try:
                 await page.wait_for_load_state("networkidle", timeout=30000)
             except Exception:
                 pass
 
-            await page.wait_for_selector("span.x-currency", timeout=60000)
+            # ✅ si NO hay resultados, corta antes de leer precios de recomendaciones
+            if await has_no_results(page):
+                return {
+                    "isbn": isbn,
+                    "price_current_eur": None,
+                    "price_previous_eur": None,
+                    "url": page.url,
+                    "error": "No results for this ISBN",
+                }
 
-            prices_raw = await page.locator("span.x-currency").all_inner_texts()
+            # ✅ intenta acotar a una zona razonable (evita precios de 'Más vistos' si se cuelan)
+            # Si CDL cambia el HTML, esto igual funciona porque cae al fallback.
+            prices_raw: List[str] = []
+
+            # 1) intento: precios dentro del área principal
+            main = page.locator("main")
+            try:
+                await main.wait_for_selector("span.x-currency", timeout=15000)
+                prices_raw = await main.locator("span.x-currency").all_inner_texts()
+            except Exception:
+                prices_raw = []
+
+            # 2) fallback: si por lo que sea no encontró en main, usa página completa
+            if not prices_raw:
+                await page.wait_for_selector("span.x-currency", timeout=60000)
+                prices_raw = await page.locator("span.x-currency").all_inner_texts()
+
             prices = [normalize_price(p) for p in prices_raw if normalize_price(p)]
+
+            # si por algún motivo hay precios pero en realidad no hay resultados, vuelve a cortar
+            if not prices and await has_no_results(page):
+                return {
+                    "isbn": isbn,
+                    "price_current_eur": None,
+                    "price_previous_eur": None,
+                    "url": page.url,
+                    "error": "No results for this ISBN",
+                }
 
             current_price = prices[-1] if prices else None
             previous_price = prices[-2] if len(prices) > 1 else None
@@ -139,15 +188,12 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
         finally:
             await page.close()
 
-# --- endpoint unitario (se queda igual, pero llamando a la función) ---
+# --- endpoint unitario ---
 @app.get("/casadellibro")
 async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
     return await scrape_casadellibro_one(isbn)
 
-# =========================
-# NUEVO: endpoint BATCH
-# =========================
-
+# --- endpoint batch ---
 class BatchRequest(BaseModel):
     isbns: List[str] = Field(..., min_items=1, description="Lista de ISBNs (10-13 dígitos)")
 
@@ -158,18 +204,13 @@ class BatchResponse(BaseModel):
 
 @app.post("/casadellibro/batch", response_model=BatchResponse)
 async def casadellibro_batch(req: BatchRequest):
-    # limpia y quita vacíos, pero sin reordenar demasiado
     isbns = [clean_isbn(x) for x in req.isbns if clean_isbn(x)]
-
-    # si el usuario manda vacío, devolvemos sin romper
     if not isbns:
         return {"source": "casadellibro", "count": 0, "results": []}
 
-    # crea tareas (la concurrencia real la controla tu semáforo)
     tasks = [scrape_casadellibro_one(isbn) for isbn in isbns]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # si alguna task explotó, la convertimos a error por item
     fixed_results: List[Dict[str, Any]] = []
     for isbn, r in zip(isbns, results):
         if isinstance(r, Exception):
