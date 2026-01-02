@@ -1,0 +1,44 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.cache/
+.pytest_cache/
+
+# ===== Virtual environments =====
+.venv/
+venv/
+env/
+
+# ===== Playwright =====
+.playwright/
+playwright-report/
+test-results/
+
+# ===== Node (NO USADO) =====
+node_modules/
+package-lock.json
+package.json
+
+# ===== Local data / outputs =====
+*.xlsx
+*.csv
+*.xls
+
+# ===== OS / Editor =====
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== Logs =====
+*.log
+
+# ===== Env vars =====
+.env
+.env.*
