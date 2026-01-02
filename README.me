@@ -1,0 +1,64 @@
+# Casa del Libro Scraper API
+
+API REST construida con FastAPI y Playwright para obtener precios de libros desde Casa del Libro a partir de un ISBN. El servicio está pensado para ejecutarse en la nube (Railway / Docker) y ser consumido desde herramientas como n8n, sin depender de scripts locales ni de archivos Excel.
+
+¿Por qué Playwright? Casa del Libro renderiza el precio dinámicamente con JavaScript, aplica políticas anti-scraping y obliga a aceptar cookies antes de mostrar los precios. Por eso no funciona un scraping clásico con requests o parsing HTML. Playwright ejecuta un navegador real (Chromium), permite aceptar cookies y garantiza que el precio obtenido sea exactamente el mismo que ve un usuario.
+
+Arquitectura del sistema:
+n8n (cloud) realiza peticiones HTTP → FastAPI (Railway) → Playwright (Chromium) → Casa del Libro.
+n8n itera por las filas de Google Sheets y solo envía el ISBN. El backend se encarga del scraping y devuelve un JSON limpio con los precios.
+
+Endpoints disponibles:
+
+GET /health  
+Devuelve el estado del servicio.  
+Respuesta:
+{"status":"ok"}
+
+GET /casadellibro?isbn=9788490366646  
+Obtiene el precio de un libro por ISBN.  
+Respuesta:
+{"isbn":"9788490366646","price_current_eur":"27.55","price_previous_eur":"29.00","url":"https://www.casadellibro.com/libros?query=9788490366646","error":null}
+
+Campos de la respuesta:
+isbn: ISBN consultado  
+price_current_eur: precio actual en euros  
+price_previous_eur: precio anterior si existe  
+url: URL de búsqueda en Casa del Libro  
+error: mensaje de error solo si ocurre timeout o bloqueo  
+
+Lógica de scraping:
+1) Se abre Chromium en modo headless  
+2) Se accede a la búsqueda por ISBN  
+3) Se aceptan cookies automáticamente  
+4) Se espera a que el selector span.x-currency esté disponible  
+5) Se extraen los precios renderizados  
+6) Se normaliza el formato (27,55 € → 27.55)  
+7) Se devuelve la información en formato JSON  
+
+Se limita la concurrencia para evitar bloqueos por parte del sitio web.
+
+Docker:
+El proyecto incluye un Dockerfile preparado para producción. Instala Python, Chromium y Playwright con todas sus dependencias. El contenedor expone el puerto 8000 y ejecuta la API con Uvicorn.
+
+Despliegue en Railway:
+1) Conectar el repositorio de GitHub  
+2) Railway detecta automáticamente Docker  
+3) Definir la variable de entorno PORT=8000  
+4) Desplegar  
+
+Una vez desplegado, la API queda accesible públicamente y puede ser utilizada por n8n cloud incluso con la máquina local apagada.
+
+Uso desde n8n:
+En n8n se utiliza un nodo HTTP Request con método GET y la URL:
+https://TU-SERVICIO.up.railway.app/casadellibro?isbn={{ $json.ISBN }}
+
+La respuesta se parsea y los campos price_current_eur y price_previous_eur se escriben directamente en Google Sheets.
+
+Este proyecto no guarda datos, no usa Excel en producción, no ejecuta scraping en batch (eso lo gestiona n8n) y no depende de ejecución local.
+
+Estado del proyecto:
+Funcional, listo para producción y diseñado para ejecución cloud.
+
+Autor:
+Proyecto desarrollado para automatización de precios editoriales mediante scraping robusto con FastAPI y Playwright.
