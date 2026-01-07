@@ -19,10 +19,6 @@ def clean_isbn(isbn: str) -> str:
     return (isbn or "").strip().replace(" ", "")
 
 def normalize_price(text: Optional[str]) -> Optional[str]:
-    """
-    Extrae números tipo 34,63 o 34.63 (con 2 decimales).
-    Devuelve string con punto decimal (ej: "34.63")
-    """
     if not text:
         return None
     m = re.search(r"(\d{1,4}(?:[.,]\d{2})?)", text)
@@ -30,21 +26,7 @@ def normalize_price(text: Optional[str]) -> Optional[str]:
         return None
     return m.group(1).replace(",", ".")
 
-def to_float_price(p: Optional[str]) -> Optional[float]:
-    if not p:
-        return None
-    try:
-        return float(p)
-    except Exception:
-        return None
-
-def fmt_price(x: Optional[float]) -> Optional[str]:
-    return f"{x:.2f}" if x is not None else None
-
 async def accept_cookies(page) -> None:
-    """
-    Intenta aceptar cookies si aparece el banner.
-    """
     for _ in range(3):
         try:
             btn = page.get_by_role("button", name=re.compile(r"(aceptar|acepto|agree)", re.I)).first
@@ -56,8 +38,9 @@ async def accept_cookies(page) -> None:
 
 async def has_no_results(page) -> bool:
     """
-    Casa del Libro cuando NO encuentra resultados muestra:
-    'No se han encontrado resultados...'
+    Casa del Libro cuando NO encuentra resultados muestra el texto:
+    'No se han encontrado resultados para ...'
+    En ese caso NO debemos leer precios de 'Más vistos' / recomendaciones.
     """
     try:
         loc = page.locator("text=/No se han encontrado resultados/i")
@@ -66,96 +49,6 @@ async def has_no_results(page) -> bool:
     except Exception:
         pass
     return False
-
-async def wait_soft_networkidle(page, timeout=30000):
-    try:
-        await page.wait_for_load_state("networkidle", timeout=timeout)
-    except Exception:
-        pass
-
-async def find_product_url_from_search(page, isbn: str) -> Optional[str]:
-    """
-    En la búsqueda por ISBN, obtiene el enlace a la ficha del producto.
-    OJO: no nos fiamos del precio aquí.
-    """
-    main = page.locator("main")
-
-    # Espera a que haya links (si hay resultados)
-    try:
-        await main.wait_for_selector('a[href]', timeout=15000)
-    except Exception:
-        pass
-
-    # Preferimos links que parezcan de ficha de libro.
-    # (si CDL cambia, igual funciona porque hay fallback)
-    candidates = main.locator('a[href*="/libro/"], a[href*="/libros/"]')
-
-    try:
-        if await candidates.count() == 0:
-            # fallback: cualquier link dentro de main
-            candidates = main.locator("a[href]")
-        await candidates.first.wait_for(state="visible", timeout=15000)
-    except Exception:
-        return None
-
-    href = await candidates.first.get_attribute("href")
-    if not href:
-        return None
-
-    if href.startswith("/"):
-        return f"https://www.casadellibro.com{href}"
-    return href
-
-async def extract_prices_from_product(page) -> Dict[str, Optional[str]]:
-    """
-    Extrae precio actual y anterior desde la ficha del producto.
-    Estrategia:
-    - Intentar acotar al bloque de compra (botón Añadir/Comprar).
-    - Si falla, fallback a main con precios visibles.
-    - Selección de current/previous:
-        - si hay 2+ precios: current = min, previous = max
-        - si hay 1: current = ese, previous = None
-    """
-    # 1) intentar encontrar área de compra (suele tener botón de acción)
-    buy_area = page.locator(
-        "main:has(button:has-text('Añadir')),"
-        "main:has(button:has-text('Añadir')),"  # algunas páginas meten NFD raro
-        "main:has(button:has-text('Comprar'))"
-    ).first
-
-    prices_raw: List[str] = []
-    try:
-        await buy_area.wait_for(state="visible", timeout=15000)
-        prices_raw = await buy_area.locator("span.x-currency:visible").all_inner_texts()
-    except Exception:
-        prices_raw = []
-
-    # 2) fallback: main visible
-    if not prices_raw:
-        try:
-            await page.wait_for_selector("main span.x-currency", timeout=20000)
-        except Exception:
-            pass
-        prices_raw = await page.locator("main span.x-currency:visible").all_inner_texts()
-
-    # Normaliza a floats, dedup y ordena
-    vals: List[float] = []
-    for t in prices_raw:
-        p = normalize_price(t)
-        f = to_float_price(p)
-        if f is not None:
-            vals.append(f)
-
-    if not vals:
-        return {"current": None, "previous": None}
-
-    uniq = sorted(set(vals))
-
-    if len(uniq) >= 2:
-        # descuento típico: actual menor, anterior mayor
-        return {"current": fmt_price(uniq[0]), "previous": fmt_price(uniq[-1])}
-
-    return {"current": fmt_price(uniq[0]), "previous": None}
 
 @app.on_event("startup")
 async def startup():
@@ -201,7 +94,7 @@ async def health():
 async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     global _context
     isbn = clean_isbn(isbn)
-    search_url = f"https://www.casadellibro.com/libros?query={isbn}"
+    url = f"https://www.casadellibro.com/libros?query={isbn}"
 
     # validación básica
     if not (10 <= len(isbn) <= 13) or not isbn.isdigit():
@@ -209,18 +102,23 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
             "isbn": isbn,
             "price_current_eur": None,
             "price_previous_eur": None,
-            "url": search_url,
+            "url": url,
             "error": "Invalid ISBN (must be 10-13 digits)",
         }
 
     async with sem:
         page = await _context.new_page()
         try:
-            # 1) ir a búsqueda
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             await accept_cookies(page)
-            await wait_soft_networkidle(page, timeout=30000)
 
+            # deja que cargue contenido dinámico
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                pass
+
+            # ✅ si NO hay resultados, corta antes de leer precios de recomendaciones
             if await has_no_results(page):
                 return {
                     "isbn": isbn,
@@ -230,38 +128,42 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
                     "error": "No results for this ISBN",
                 }
 
-            # 2) encontrar URL de ficha del producto
-            product_url = await find_product_url_from_search(page, isbn)
-            if not product_url:
+            # ✅ intenta acotar a una zona razonable (evita precios de 'Más vistos' si se cuelan)
+            # Si CDL cambia el HTML, esto igual funciona porque cae al fallback.
+            prices_raw: List[str] = []
+
+            # 1) intento: precios dentro del área principal
+            main = page.locator("main")
+            try:
+                await main.wait_for_selector("span.x-currency", timeout=15000)
+                prices_raw = await main.locator("span.x-currency").all_inner_texts()
+            except Exception:
+                prices_raw = []
+
+            # 2) fallback: si por lo que sea no encontró en main, usa página completa
+            if not prices_raw:
+                await page.wait_for_selector("span.x-currency", timeout=60000)
+                prices_raw = await page.locator("span.x-currency").all_inner_texts()
+
+            prices = [normalize_price(p) for p in prices_raw if normalize_price(p)]
+
+            # si por algún motivo hay precios pero en realidad no hay resultados, vuelve a cortar
+            if not prices and await has_no_results(page):
                 return {
                     "isbn": isbn,
                     "price_current_eur": None,
                     "price_previous_eur": None,
                     "url": page.url,
-                    "error": "Could not find product link",
+                    "error": "No results for this ISBN",
                 }
 
-            # 3) ir a ficha
-            await page.goto(product_url, wait_until="domcontentloaded", timeout=90000)
-            await accept_cookies(page)
-            await wait_soft_networkidle(page, timeout=30000)
-
-            # 4) extraer precios desde ficha
-            prices = await extract_prices_from_product(page)
-
-            if not prices["current"]:
-                return {
-                    "isbn": isbn,
-                    "price_current_eur": None,
-                    "price_previous_eur": None,
-                    "url": page.url,
-                    "error": "No price found on product page",
-                }
+            current_price = prices[-1] if prices else None
+            previous_price = prices[-2] if len(prices) > 1 else None
 
             return {
                 "isbn": isbn,
-                "price_current_eur": prices["current"],
-                "price_previous_eur": prices["previous"],
+                "price_current_eur": current_price,
+                "price_previous_eur": previous_price,
                 "url": page.url,
                 "error": None,
             }
@@ -271,7 +173,7 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
                 "isbn": isbn,
                 "price_current_eur": None,
                 "price_previous_eur": None,
-                "url": search_url,
+                "url": url,
                 "error": f"Timeout ({isbn})",
             }
 
@@ -280,7 +182,7 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
                 "isbn": isbn,
                 "price_current_eur": None,
                 "price_previous_eur": None,
-                "url": search_url,
+                "url": url,
                 "error": str(e),
             }
         finally:
