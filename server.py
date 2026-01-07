@@ -37,11 +37,6 @@ async def accept_cookies(page) -> None:
             pass
 
 async def has_no_results(page) -> bool:
-    """
-    Casa del Libro cuando NO encuentra resultados muestra el texto:
-    'No se han encontrado resultados para ...'
-    En ese caso NO debemos leer precios de 'Más vistos' / recomendaciones.
-    """
     try:
         loc = page.locator("text=/No se han encontrado resultados/i")
         if await loc.count() > 0 and await loc.first.is_visible():
@@ -49,6 +44,86 @@ async def has_no_results(page) -> bool:
     except Exception:
         pass
     return False
+
+async def wait_soft_networkidle(page, timeout=30000):
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+
+async def find_result_card_for_isbn(page, isbn: str):
+    """
+    Devuelve el locator del 'article' del resultado correcto.
+    Primero intenta anclar por link que contenga el ISBN en el href.
+    Si no, cae al primer article dentro del main.
+    """
+    main = page.locator("main")
+
+    # 1) anclar por href que contiene el ISBN (en tu captura el href lo incluye)
+    link = main.locator(f'a[href*="{isbn}"]').first
+    try:
+        await link.wait_for(state="visible", timeout=8000)
+        # subir al article contenedor
+        card = link.locator("xpath=ancestor::article[1]")
+        if await card.count() > 0:
+            return card.first
+    except Exception:
+        pass
+
+    # 2) fallback: primer article visible en main (resultado principal)
+    card = main.locator("article").first
+    await card.wait_for(state="visible", timeout=15000)
+    return card
+
+async def extract_prices_from_card(card) -> Dict[str, Optional[str]]:
+    """
+    Extrae:
+      - precio actual: preferimos el de oferta (x-result-current-price-on-sale)
+      - precio anterior: precio tachado (x-result-previous-price) si existe
+
+    Usamos selectores por:
+      - data-test (más estable)
+      - clases vistas en tu DevTools
+    """
+    # precio actual: primero "on sale"
+    current_locators = [
+        card.locator('[data-test="result-current-price"] span.x-currency'),
+        card.locator(".x-result-current-price-on-sale span.x-currency"),
+        card.locator(".x-result-current-price span.x-currency"),
+    ]
+
+    current_text = None
+    for loc in current_locators:
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                current_text = (await loc.first.inner_text()).strip()
+                if current_text:
+                    break
+        except Exception:
+            pass
+
+    # precio anterior (tachado)
+    previous_locators = [
+        card.locator('[data-test="result-previous-price"] span.x-currency'),
+        card.locator(".x-result-previous-price span.x-currency"),
+        # fallback: un span x-currency que esté dentro de un texto tachado
+        card.locator("del span.x-currency"),
+    ]
+
+    previous_text = None
+    for loc in previous_locators:
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                previous_text = (await loc.first.inner_text()).strip()
+                if previous_text:
+                    break
+        except Exception:
+            pass
+
+    return {
+        "current": normalize_price(current_text),
+        "previous": normalize_price(previous_text),
+    }
 
 @app.on_event("startup")
 async def startup():
@@ -90,13 +165,11 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
-# --- scraping reutilizable ---
 async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     global _context
     isbn = clean_isbn(isbn)
     url = f"https://www.casadellibro.com/libros?query={isbn}"
 
-    # validación básica
     if not (10 <= len(isbn) <= 13) or not isbn.isdigit():
         return {
             "isbn": isbn,
@@ -111,14 +184,8 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             await accept_cookies(page)
+            await wait_soft_networkidle(page, timeout=30000)
 
-            # deja que cargue contenido dinámico
-            try:
-                await page.wait_for_load_state("networkidle", timeout=30000)
-            except Exception:
-                pass
-
-            # ✅ si NO hay resultados, corta antes de leer precios de recomendaciones
             if await has_no_results(page):
                 return {
                     "isbn": isbn,
@@ -128,42 +195,23 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
                     "error": "No results for this ISBN",
                 }
 
-            # ✅ intenta acotar a una zona razonable (evita precios de 'Más vistos' si se cuelan)
-            # Si CDL cambia el HTML, esto igual funciona porque cae al fallback.
-            prices_raw: List[str] = []
+            # clave: NO coger todos los precios de main. Solo del card correcto.
+            card = await find_result_card_for_isbn(page, isbn)
+            prices = await extract_prices_from_card(card)
 
-            # 1) intento: precios dentro del área principal
-            main = page.locator("main")
-            try:
-                await main.wait_for_selector("span.x-currency", timeout=15000)
-                prices_raw = await main.locator("span.x-currency").all_inner_texts()
-            except Exception:
-                prices_raw = []
-
-            # 2) fallback: si por lo que sea no encontró en main, usa página completa
-            if not prices_raw:
-                await page.wait_for_selector("span.x-currency", timeout=60000)
-                prices_raw = await page.locator("span.x-currency").all_inner_texts()
-
-            prices = [normalize_price(p) for p in prices_raw if normalize_price(p)]
-
-            # si por algún motivo hay precios pero en realidad no hay resultados, vuelve a cortar
-            if not prices and await has_no_results(page):
+            if not prices["current"]:
                 return {
                     "isbn": isbn,
                     "price_current_eur": None,
                     "price_previous_eur": None,
                     "url": page.url,
-                    "error": "No results for this ISBN",
+                    "error": "Price not found in result card",
                 }
-
-            current_price = prices[-1] if prices else None
-            previous_price = prices[-2] if len(prices) > 1 else None
 
             return {
                 "isbn": isbn,
-                "price_current_eur": current_price,
-                "price_previous_eur": previous_price,
+                "price_current_eur": prices["current"],
+                "price_previous_eur": prices["previous"],
                 "url": page.url,
                 "error": None,
             }
@@ -188,12 +236,10 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
         finally:
             await page.close()
 
-# --- endpoint unitario ---
 @app.get("/casadellibro")
 async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
     return await scrape_casadellibro_one(isbn)
 
-# --- endpoint batch ---
 class BatchRequest(BaseModel):
     isbns: List[str] = Field(..., min_items=1, description="Lista de ISBNs (10-13 dígitos)")
 
