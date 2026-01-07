@@ -27,11 +27,12 @@ def normalize_price(text: Optional[str]) -> Optional[str]:
     return m.group(1).replace(",", ".")
 
 async def accept_cookies(page) -> None:
-    for _ in range(3):
+    # no bloquea: intenta, si no, sigue
+    for _ in range(2):
         try:
             btn = page.get_by_role("button", name=re.compile(r"(aceptar|acepto|agree)", re.I)).first
-            await btn.click(timeout=2500)
-            await page.wait_for_timeout(500)
+            await btn.click(timeout=1500)
+            await page.wait_for_timeout(250)
             return
         except Exception:
             pass
@@ -45,78 +46,60 @@ async def has_no_results(page) -> bool:
         pass
     return False
 
-async def wait_soft_networkidle(page, timeout=30000):
-    try:
-        await page.wait_for_load_state("networkidle", timeout=timeout)
-    except Exception:
-        pass
-
-async def find_result_card_for_isbn(page, isbn: str):
+async def wait_for_result_card(page, isbn: str, timeout=25000):
     """
-    Devuelve el locator del 'article' del resultado correcto.
-    Primero intenta anclar por link que contenga el ISBN en el href.
-    Si no, cae al primer article dentro del main.
+    Espera el article del resultado correcto anclando por href con ISBN.
     """
     main = page.locator("main")
 
-    # 1) anclar por href que contiene el ISBN (en tu captura el href lo incluye)
-    link = main.locator(f'a[href*="{isbn}"]').first
-    try:
-        await link.wait_for(state="visible", timeout=8000)
-        # subir al article contenedor
-        card = link.locator("xpath=ancestor::article[1]")
-        if await card.count() > 0:
-            return card.first
-    except Exception:
-        pass
-
-    # 2) fallback: primer article visible en main (resultado principal)
-    card = main.locator("article").first
-    await card.wait_for(state="visible", timeout=15000)
+    # selector robusto: article que contenga un link con el isbn
+    card = main.locator(f'article:has(a[href*="{isbn}"])').first
+    await card.wait_for(state="visible", timeout=timeout)
     return card
 
 async def extract_prices_from_card(card) -> Dict[str, Optional[str]]:
     """
-    Extrae:
-      - precio actual: preferimos el de oferta (x-result-current-price-on-sale)
-      - precio anterior: precio tachado (x-result-previous-price) si existe
-
-    Usamos selectores por:
-      - data-test (más estable)
-      - clases vistas en tu DevTools
+    Usa data-test (estable) y fallback a spans dentro del card.
     """
-    # precio actual: primero "on sale"
-    current_locators = [
-        card.locator('[data-test="result-current-price"] span.x-currency'),
-        card.locator(".x-result-current-price-on-sale span.x-currency"),
-        card.locator(".x-result-current-price span.x-currency"),
-    ]
-
     current_text = None
-    for loc in current_locators:
+    previous_text = None
+
+    # current (precio actual)
+    current_candidates = [
+        card.locator('[data-test="result-current-price"] span.x-currency').first,
+        card.locator(".x-result-current-price-on-sale span.x-currency").first,
+        card.locator(".x-result-current-price span.x-currency").first,
+    ]
+    for loc in current_candidates:
         try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                current_text = (await loc.first.inner_text()).strip()
+            if await loc.count() > 0 and await loc.is_visible():
+                current_text = (await loc.inner_text()).strip()
                 if current_text:
                     break
         except Exception:
             pass
 
-    # precio anterior (tachado)
-    previous_locators = [
-        card.locator('[data-test="result-previous-price"] span.x-currency'),
-        card.locator(".x-result-previous-price span.x-currency"),
-        # fallback: un span x-currency que esté dentro de un texto tachado
-        card.locator("del span.x-currency"),
+    # previous (tachado)
+    prev_candidates = [
+        card.locator("del span.x-currency").first,
+        card.locator(".x-result-previous-price span.x-currency").first,
+        card.locator('[data-test="result-previous-price"] span.x-currency').first,
     ]
-
-    previous_text = None
-    for loc in previous_locators:
+    for loc in prev_candidates:
         try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                previous_text = (await loc.first.inner_text()).strip()
+            if await loc.count() > 0 and await loc.is_visible():
+                previous_text = (await loc.inner_text()).strip()
                 if previous_text:
                     break
+        except Exception:
+            pass
+
+    # fallback final: si no encontró current por data-test, coge el primer x-currency del card
+    if not current_text:
+        try:
+            fallback = card.locator("span.x-currency:visible").first
+            if await fallback.count() > 0:
+                current_text = (await fallback.inner_text()).strip()
         except Exception:
             pass
 
@@ -165,6 +148,11 @@ async def shutdown():
 async def health():
     return {"status": "ok"}
 
+@app.get("/version")
+async def version():
+    return {"version": "2026-01-07-timeout-fix-card-scoped-v1"}
+
+# --- scraping reutilizable ---
 async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     global _context
     isbn = clean_isbn(isbn)
@@ -182,39 +170,51 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
     async with sem:
         page = await _context.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-            await accept_cookies(page)
-            await wait_soft_networkidle(page, timeout=30000)
+            # retries cortos: Railway a veces va lento
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+                    await accept_cookies(page)
 
-            if await has_no_results(page):
-                return {
-                    "isbn": isbn,
-                    "price_current_eur": None,
-                    "price_previous_eur": None,
-                    "url": page.url,
-                    "error": "No results for this ISBN",
-                }
+                    # no dependemos de networkidle (en SPA a veces nunca llega)
+                    # esperamos a que aparezca el resultado
+                    if await has_no_results(page):
+                        return {
+                            "isbn": isbn,
+                            "price_current_eur": None,
+                            "price_previous_eur": None,
+                            "url": page.url,
+                            "error": "No results for this ISBN",
+                        }
 
-            # clave: NO coger todos los precios de main. Solo del card correcto.
-            card = await find_result_card_for_isbn(page, isbn)
-            prices = await extract_prices_from_card(card)
+                    card = await wait_for_result_card(page, isbn, timeout=25000)
+                    prices = await extract_prices_from_card(card)
 
-            if not prices["current"]:
-                return {
-                    "isbn": isbn,
-                    "price_current_eur": None,
-                    "price_previous_eur": None,
-                    "url": page.url,
-                    "error": "Price not found in result card",
-                }
+                    if not prices["current"]:
+                        return {
+                            "isbn": isbn,
+                            "price_current_eur": None,
+                            "price_previous_eur": None,
+                            "url": page.url,
+                            "error": "Price not found in result card",
+                        }
 
-            return {
-                "isbn": isbn,
-                "price_current_eur": prices["current"],
-                "price_previous_eur": prices["previous"],
-                "url": page.url,
-                "error": None,
-            }
+                    return {
+                        "isbn": isbn,
+                        "price_current_eur": prices["current"],
+                        "price_previous_eur": prices["previous"],
+                        "url": page.url,
+                        "error": None,
+                    }
+
+                except Exception as e:
+                    last_err = e
+                    # pequeña pausa y reintento
+                    await page.wait_for_timeout(500 * attempt)
+
+            # si falló todo
+            raise last_err
 
         except PlaywrightTimeoutError:
             return {
@@ -224,7 +224,6 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
                 "url": url,
                 "error": f"Timeout ({isbn})",
             }
-
         except Exception as e:
             return {
                 "isbn": isbn,
@@ -236,10 +235,12 @@ async def scrape_casadellibro_one(isbn: str) -> Dict[str, Any]:
         finally:
             await page.close()
 
+# --- endpoint unitario ---
 @app.get("/casadellibro")
 async def casadellibro(isbn: str = Query(..., min_length=10, max_length=13)):
     return await scrape_casadellibro_one(isbn)
 
+# --- endpoint batch ---
 class BatchRequest(BaseModel):
     isbns: List[str] = Field(..., min_items=1, description="Lista de ISBNs (10-13 dígitos)")
 
