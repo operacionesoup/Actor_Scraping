@@ -13,6 +13,14 @@ _context = None
 _browser_ready = asyncio.Event()
 sem = asyncio.Semaphore(1)
 
+# Script de stealth para inyectar en cada página — evita detección de bots
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['es-ES', 'es', 'en']});
+window.chrome = {runtime: {}};
+"""
+
 
 def normalize_price(text: Optional[str]) -> Optional[str]:
     if not text:
@@ -32,6 +40,26 @@ class BatchRequest(BaseModel):
     pause_ms: int = Field(default=1000, ge=0, le=10000)
 
 
+async def _create_stealth_context():
+    """Crea un contexto con anti-detección configurado."""
+    global _browser
+    ctx = await _browser.new_context(
+        locale="es-ES",
+        viewport={"width": 1366, "height": 768},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        extra_http_headers={
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        },
+    )
+    # Inyecta el script stealth ANTES de que cargue cualquier página
+    await ctx.add_init_script(STEALTH_SCRIPT)
+    return ctx
+
+
 async def _launch_browser():
     """Arranca Playwright en background sin bloquear el healthcheck."""
     global _pw, _browser, _context
@@ -44,26 +72,17 @@ async def _launch_browser():
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
-        _context = await _browser.new_context(
-            locale="es-ES",
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
+        _context = await _create_stealth_context()
         _browser_ready.set()
-    except Exception as e:
-        # Si falla al arrancar, se reintentará en la primera petición
-        _browser_ready.set()  # desbloquea para que los endpoints no esperen forever
+    except Exception:
+        _browser_ready.set()
 
 
 @app.on_event("startup")
 async def startup():
-    # Lanza el browser en segundo plano — /health responde inmediatamente
     asyncio.create_task(_launch_browser())
 
 
@@ -90,25 +109,15 @@ async def get_context():
     """Espera a que el browser esté listo y devuelve el contexto."""
     global _pw, _browser, _context
 
-    # Espera máximo 30s a que el browser arranque
     await asyncio.wait_for(_browser_ready.wait(), timeout=30)
 
-    # Si el browser murió, lo relanza
     if _browser is None or not _browser.is_connected():
         _browser_ready.clear()
         await _launch_browser()
         await asyncio.wait_for(_browser_ready.wait(), timeout=30)
 
     if _context is None:
-        _context = await _browser.new_context(
-            locale="es-ES",
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
+        _context = await _create_stealth_context()
     return _context
 
 
@@ -179,15 +188,16 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Espera a que aparezcan resultados (CSS válido) con timeout razonable
+            # Espera a que aparezcan resultados con timeout razonable
             try:
                 await page.wait_for_selector(
                     'span.x-currency, [data-test="search-result-item"], '
                     '[data-testid="search-result-item"], article',
-                    timeout=15000,
+                    timeout=20000,
                 )
             except PlaywrightTimeoutError:
-                pass
+                # Si no aparecen, esperamos un poco más por si es un JS render lento
+                await page.wait_for_timeout(3000)
 
             await accept_cookies(page)
 
@@ -208,9 +218,8 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                 }
 
             card = await get_first_result_card(page)
-            # Si no hay card, espera un poco más y reintenta una vez
             if card is None:
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
                 card = await get_first_result_card(page)
 
             scope = card if card is not None else page
@@ -262,7 +271,6 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            # Fallback: recoge todos los precios de la página
             if current_price is None:
                 try:
                     all_prices = await scope.locator("span.x-currency").all_inner_texts()
@@ -339,3 +347,42 @@ async def casadellibro_batch(req: BatchRequest):
         "error_count": error_count,
         "results": results,
     }
+
+
+@app.get("/debug")
+async def debug(isbn: str = Query(..., min_length=10, max_length=13)):
+    """Endpoint de diagnóstico — devuelve el HTML crudo que ve el browser."""
+    async with sem:
+        try:
+            ctx = await get_context()
+            page = await ctx.new_page()
+        except Exception as e:
+            return {"error": f"Browser: {e}"}
+
+        try:
+            url = f"https://www.casadellibro.com/libros?query={isbn}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000)
+            await accept_cookies(page)
+
+            html = await page.content()
+            text = await page.locator("body").inner_text(timeout=5000)
+            current_url = page.url
+
+            # Busca selectores clave
+            price_count = await page.locator("span.x-currency").count()
+            article_count = await page.locator("article").count()
+            result_item_count = await page.locator('[data-test="search-result-item"]').count()
+
+            return {
+                "current_url": current_url,
+                "html_length": len(html),
+                "body_text_preview": text[:2000],
+                "price_elements_found": price_count,
+                "article_elements_found": article_count,
+                "search_result_items_found": result_item_count,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            await page.close()
