@@ -196,23 +196,32 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                     timeout=20000,
                 )
             except PlaywrightTimeoutError:
-                # Si no aparecen, esperamos un poco más por si es un JS render lento
                 await page.wait_for_timeout(3000)
 
             await accept_cookies(page)
 
-            body_text = ""
+            # Detectar "No se han encontrado resultados" con locator directo
+            no_results = False
             try:
-                body_text = await page.locator("body").inner_text(timeout=3000)
+                loc = page.get_by_text("No se han encontrado resultados")
+                if await loc.count() > 0:
+                    no_results = True
             except Exception:
                 pass
+            if not no_results:
+                try:
+                    loc = page.get_by_text("No se encontraron resultados")
+                    if await loc.count() > 0:
+                        no_results = True
+                except Exception:
+                    pass
 
-            if "No se han encontrado resultados" in body_text or "No se encontraron resultados" in body_text:
+            if no_results:
                 return {
                     "isbn": isbn,
-                    "title": None,
-                    "price_current_eur": None,
-                    "price_previous_eur": None,
+                    "title": "-",
+                    "price_current_eur": "-",
+                    "price_previous_eur": "-",
                     "url": page.url,
                     "error": "No se encontraron resultados",
                 }
