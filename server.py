@@ -10,7 +10,8 @@ app = FastAPI(title="Casa del Libro API")
 _pw = None
 _browser = None
 _context = None
-sem = asyncio.Semaphore(1)  # una petición de Playwright a la vez
+_browser_ready = asyncio.Event()
+sem = asyncio.Semaphore(1)
 
 
 def normalize_price(text: Optional[str]) -> Optional[str]:
@@ -28,18 +29,13 @@ def clean_isbn(isbn: str) -> str:
 
 class BatchRequest(BaseModel):
     isbns: List[str] = Field(..., min_length=1, max_length=50)
-    pause_ms: int = Field(default=2000, ge=0, le=10000)
+    pause_ms: int = Field(default=1000, ge=0, le=10000)
 
 
-async def ensure_browser():
-    """Inicialización lazy: arranca Playwright solo cuando hace falta."""
+async def _launch_browser():
+    """Arranca Playwright en background sin bloquear el healthcheck."""
     global _pw, _browser, _context
-    if _browser is None or not _browser.is_connected():
-        if _pw is not None:
-            try:
-                await _pw.stop()
-            except Exception:
-                pass
+    try:
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
             headless=True,
@@ -48,12 +44,8 @@ async def ensure_browser():
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
-                "--single-process",
             ],
         )
-        _context = None
-
-    if _context is None:
         _context = await _browser.new_context(
             locale="es-ES",
             viewport={"width": 1366, "height": 768},
@@ -63,7 +55,16 @@ async def ensure_browser():
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-    return _context
+        _browser_ready.set()
+    except Exception as e:
+        # Si falla al arrancar, se reintentará en la primera petición
+        _browser_ready.set()  # desbloquea para que los endpoints no esperen forever
+
+
+@app.on_event("startup")
+async def startup():
+    # Lanza el browser en segundo plano — /health responde inmediatamente
+    asyncio.create_task(_launch_browser())
 
 
 @app.on_event("shutdown")
@@ -82,58 +83,66 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "browser_ready": _browser_ready.is_set()}
+
+
+async def get_context():
+    """Espera a que el browser esté listo y devuelve el contexto."""
+    global _pw, _browser, _context
+
+    # Espera máximo 30s a que el browser arranque
+    await asyncio.wait_for(_browser_ready.wait(), timeout=30)
+
+    # Si el browser murió, lo relanza
+    if _browser is None or not _browser.is_connected():
+        _browser_ready.clear()
+        await _launch_browser()
+        await asyncio.wait_for(_browser_ready.wait(), timeout=30)
+
+    if _context is None:
+        _context = await _browser.new_context(
+            locale="es-ES",
+            viewport={"width": 1366, "height": 768},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+    return _context
 
 
 async def accept_cookies(page) -> None:
-    patterns = [
-        re.compile(r"(aceptar|acepto|agree|accept)", re.I),
-    ]
-
-    for _ in range(3):
-        for pattern in patterns:
-            try:
-                btn = page.get_by_role("button", name=pattern).first
-                if await btn.is_visible(timeout=1500):
-                    await btn.click(timeout=3000)
-                    await page.wait_for_timeout(700)
-                    return
-            except Exception:
-                pass
-
-        for sel in [
-            "#onetrust-accept-btn-handler",
-            'button:has-text("Aceptar")',
-            'button:has-text("Aceptar cookies")',
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click(timeout=3000)
-                    await page.wait_for_timeout(700)
-                    return
-            except Exception:
-                pass
+    for sel in [
+        "#onetrust-accept-btn-handler",
+        'button:has-text("Aceptar cookies")',
+        'button:has-text("Aceptar")',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible(timeout=1000):
+                await loc.click(timeout=2000)
+                await page.wait_for_timeout(300)
+                return
+        except Exception:
+            pass
 
 
 async def get_first_result_card(page):
-    candidate_selectors = [
+    for sel in [
         '[data-test="search-result-item"]',
         '[data-testid="search-result-item"]',
         '.product-grid-item',
         '.product-item',
         '.search-result-item',
         'article',
-    ]
-
-    for sel in candidate_selectors:
+    ]:
         try:
             loc = page.locator(sel)
             if await loc.count() > 0:
                 return loc.first
         except Exception:
             pass
-
     return None
 
 
@@ -153,26 +162,34 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
         }
 
     async with sem:
-        # Inicializa Playwright si no está listo, o lo reinicia si murió
         try:
-            ctx = await ensure_browser()
+            ctx = await get_context()
             page = await ctx.new_page()
-        except Exception:
+        except Exception as e:
             _context = None
-            ctx = await ensure_browser()
-            page = await ctx.new_page()
+            return {
+                "isbn": isbn,
+                "title": None,
+                "price_current_eur": None,
+                "price_previous_eur": None,
+                "url": url,
+                "error": f"Error iniciando browser: {e}",
+            }
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2500)
 
-            await accept_cookies(page)
-            await page.wait_for_timeout(1500)
-
+            # Espera a que aparezcan resultados (CSS válido) con timeout razonable
             try:
-                await page.wait_for_selector("body", timeout=5000)
+                await page.wait_for_selector(
+                    'span.x-currency, [data-test="search-result-item"], '
+                    '[data-testid="search-result-item"], article',
+                    timeout=15000,
+                )
             except PlaywrightTimeoutError:
                 pass
+
+            await accept_cookies(page)
 
             body_text = ""
             try:
@@ -190,27 +207,16 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                     "error": "No se encontraron resultados",
                 }
 
-            card = None
-            for _ in range(5):
+            card = await get_first_result_card(page)
+            # Si no hay card, espera un poco más y reintenta una vez
+            if card is None:
+                await page.wait_for_timeout(1500)
                 card = await get_first_result_card(page)
-                if card is not None:
-                    break
-                await page.wait_for_timeout(1000)
 
             scope = card if card is not None else page
 
             title = None
-            title_selectors = [
-                '[data-test="result-title"]',
-                '[data-testid="result-title"]',
-                'h2',
-                'h3',
-                '.title',
-                '.product-title',
-                'a[title]',
-            ]
-
-            for sel in title_selectors:
+            for sel in ['[data-test="result-title"]', '[data-testid="result-title"]', 'h2', 'h3', '.title', 'a[title]']:
                 try:
                     loc = scope.locator(sel).first
                     if await loc.count() > 0:
@@ -218,35 +224,19 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                         if txt:
                             title = txt
                             break
-                    attr = await loc.get_attribute("title")
-                    if attr and attr.strip():
-                        title = attr.strip()
-                        break
                 except Exception:
                     pass
 
             current_price = None
             previous_price = None
 
-            current_price_selectors = [
+            for sel in [
                 '[data-test="result-current-price"] span.x-currency',
                 '[data-testid="result-current-price"] span.x-currency',
                 '[data-test="result-current-price"]',
                 '.price-current',
-                '.price',
                 'span.x-currency',
-            ]
-
-            previous_price_selectors = [
-                '[data-test="result-previous-price"] span.x-currency',
-                '[data-testid="result-previous-price"] span.x-currency',
-                '[data-test="result-previous-price"]',
-                '.price-old',
-                '.old-price',
-                '.price-previous',
-            ]
-
-            for sel in current_price_selectors:
+            ]:
                 try:
                     texts = await scope.locator(sel).all_inner_texts()
                     values = [normalize_price(t) for t in texts if normalize_price(t)]
@@ -256,7 +246,13 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            for sel in previous_price_selectors:
+            for sel in [
+                '[data-test="result-previous-price"] span.x-currency',
+                '[data-testid="result-previous-price"] span.x-currency',
+                '[data-test="result-previous-price"]',
+                '.price-old',
+                '.old-price',
+            ]:
                 try:
                     texts = await scope.locator(sel).all_inner_texts()
                     values = [normalize_price(t) for t in texts if normalize_price(t)]
@@ -266,17 +262,17 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
+            # Fallback: recoge todos los precios de la página
             if current_price is None:
                 try:
                     all_prices = await scope.locator("span.x-currency").all_inner_texts()
                     values = [normalize_price(t) for t in all_prices if normalize_price(t)]
-                    seen = set()
+                    seen: set = set()
                     dedup = []
                     for v in values:
                         if v not in seen:
                             seen.add(v)
                             dedup.append(v)
-
                     if len(dedup) >= 1:
                         current_price = dedup[0]
                     if len(dedup) >= 2:
@@ -330,7 +326,6 @@ async def casadellibro_batch(req: BatchRequest):
     for i, isbn in enumerate(isbns):
         result = await scrape_casadellibro_isbn(isbn)
         results.append(result)
-
         if i < len(isbns) - 1 and req.pause_ms > 0:
             await asyncio.sleep(req.pause_ms / 1000)
 
