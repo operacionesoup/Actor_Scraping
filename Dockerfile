@@ -1,13 +1,13 @@
-# Imagen oficial de Playwright (ya trae Chromium + dependencias)
+# Imagen oficial de Playwright
 FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
 
 WORKDIR /app
 
-# Instala dependencias Python
+# Instalar dependencias Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia el proyecto
+# Copiar el proyecto
 COPY . .
 
 # Railway expone el puerto por la variable PORT
