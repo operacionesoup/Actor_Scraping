@@ -31,39 +31,39 @@ class BatchRequest(BaseModel):
     pause_ms: int = Field(default=2000, ge=0, le=10000)
 
 
-async def create_context():
-    global _browser
-    return await _browser.new_context(
-        locale="es-ES",
-        viewport={"width": 1366, "height": 768},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-    )
-
-
-async def get_context():
-    global _context
-    if _context is None:
-        _context = await create_context()
-    return _context
-
-
-@app.on_event("startup")
-async def startup():
+async def ensure_browser():
+    """Inicialización lazy: arranca Playwright solo cuando hace falta."""
     global _pw, _browser, _context
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    )
-    _context = await create_context()
+    if _browser is None or not _browser.is_connected():
+        if _pw is not None:
+            try:
+                await _pw.stop()
+            except Exception:
+                pass
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--single-process",
+            ],
+        )
+        _context = None
+
+    if _context is None:
+        _context = await _browser.new_context(
+            locale="es-ES",
+            viewport={"width": 1366, "height": 768},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+    return _context
 
 
 @app.on_event("shutdown")
@@ -153,19 +153,13 @@ async def scrape_casadellibro_isbn(isbn: str) -> Dict[str, Any]:
         }
 
     async with sem:
-        # Recuperar contexto si fue cerrado/invalidado
+        # Inicializa Playwright si no está listo, o lo reinicia si murió
         try:
-            ctx = await get_context()
-        except Exception:
-            _context = None
-            ctx = await get_context()
-
-        try:
+            ctx = await ensure_browser()
             page = await ctx.new_page()
         except Exception:
-            # Contexto inválido, recrearlo
             _context = None
-            ctx = await get_context()
+            ctx = await ensure_browser()
             page = await ctx.new_page()
 
         try:
